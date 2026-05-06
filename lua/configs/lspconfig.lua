@@ -1,0 +1,285 @@
+local mason_lspconfig = require "mason-lspconfig"
+local mason_tool_installer = require "mason-tool-installer"
+local nvchad_lsp = require "nvchad.configs.lspconfig"
+local util = require "lspconfig.util"
+local mason_opts = require "configs.mason"
+local paths = require "configs.paths"
+
+require("mason").setup(mason_opts)
+
+mason_lspconfig.setup {
+  ensure_installed = paths.python_venv_support() and {
+    "lua_ls",
+    "gopls",
+    "basedpyright",
+  } or {
+    "lua_ls",
+    "gopls",
+  },
+  automatic_enable = false,
+  automatic_installation = true,
+}
+
+mason_tool_installer.setup {
+  ensure_installed = mason_opts.ensure_installed,
+  auto_update = false,
+  run_on_start = true,
+  start_delay = 3000,
+}
+
+local capabilities = vim.deepcopy(nvchad_lsp.capabilities)
+local ok_cmp, cmp_nvim_lsp = pcall(require, "cmp_nvim_lsp")
+if ok_cmp then
+  capabilities = cmp_nvim_lsp.default_capabilities(capabilities)
+end
+
+dofile(vim.g.base46_cache .. "lsp")
+require("nvchad.lsp").diagnostic_config()
+
+local on_attach = function(client, bufnr)
+  nvchad_lsp.on_attach(client, bufnr)
+  vim.bo[bufnr].omnifunc = "v:lua.vim.lsp.omnifunc"
+end
+
+local on_init = function(client, _)
+  nvchad_lsp.on_init(client, _)
+end
+
+local lua_ls_cmd = paths.first(
+  paths.mason_path("lua-language-server", {
+    unix = "lua-language-server",
+    win = "bin/lua-language-server.exe",
+  }),
+  paths.executable "lua-language-server"
+)
+
+local gopls_cmd = paths.first(
+  paths.mason_path("gopls", {
+    unix = "gopls",
+    win = "gopls.exe",
+  }),
+  paths.executable "gopls"
+)
+
+local basedpyright_cmd = paths.first(
+  paths.mason_path("basedpyright", {
+    unix = "venv/bin/basedpyright-langserver",
+    win = "venv/Scripts/basedpyright-langserver.exe",
+  }),
+  paths.executable "basedpyright-langserver"
+)
+
+local html_cmd = paths.first(
+  paths.mason_path("html-lsp", {
+    unix = "node_modules/vscode-langservers-extracted/bin/vscode-html-language-server",
+    win = "node_modules/vscode-langservers-extracted/bin/vscode-html-language-server.cmd",
+  }),
+  paths.executable "vscode-html-language-server"
+)
+
+local css_cmd = paths.first(
+  paths.mason_path("css-lsp", {
+    unix = "node_modules/vscode-langservers-extracted/bin/vscode-css-language-server",
+    win = "node_modules/vscode-langservers-extracted/bin/vscode-css-language-server.cmd",
+  }),
+  paths.executable "vscode-css-language-server"
+)
+
+local tailwindcss_cmd = paths.first(
+  paths.mason_path("tailwindcss-language-server", {
+    unix = "node_modules/@tailwindcss/language-server/bin/tailwindcss-language-server",
+    win = "node_modules/@tailwindcss/language-server/bin/tailwindcss-language-server.cmd",
+  }),
+  paths.executable "tailwindcss-language-server"
+)
+
+local marksman_cmd = paths.executable "marksman"
+
+local function resolve_root(markers, fallback_to_dir)
+  local matcher = util.root_pattern(unpack(markers))
+
+  return function(bufnr, on_dir)
+    local fname = vim.api.nvim_buf_get_name(bufnr)
+    local root = matcher(fname)
+
+    if not root and fallback_to_dir then
+      root = vim.fs.dirname(fname)
+    end
+
+    on_dir(root)
+  end
+end
+
+vim.api.nvim_create_autocmd("LspAttach", {
+  group = vim.api.nvim_create_augroup("UserLspConfig", { clear = true }),
+  callback = function(args)
+    local client_id = args.data and args.data.client_id
+    if not client_id then
+      return
+    end
+
+    local client = vim.lsp.get_client_by_id(client_id)
+    local ft = vim.bo[args.buf].filetype
+    local bufname = vim.api.nvim_buf_get_name(args.buf)
+    local is_razor_buffer = ft == "razor" or ft == "cshtml" or bufname:match "__virtual%."
+
+    if client and client.server_capabilities.inlayHintProvider and vim.lsp.inlay_hint and not is_razor_buffer then
+      vim.lsp.inlay_hint.enable(true, { bufnr = args.buf })
+    end
+  end,
+})
+
+local server_configs = {
+  lua_ls = {
+    cmd = lua_ls_cmd and { lua_ls_cmd } or nil,
+    settings = {
+      Lua = {
+        completion = {
+          callSnippet = "Replace",
+        },
+        diagnostics = {
+          globals = { "vim" },
+        },
+        hint = {
+          enable = true,
+        },
+      },
+    },
+  },
+  gopls = {
+    cmd = gopls_cmd and { gopls_cmd } or nil,
+    root_dir = resolve_root({ "go.work", "go.mod", ".git" }, false),
+    settings = {
+      gopls = {
+        analyses = {
+          nilness = true,
+          unusedparams = true,
+          unusedwrite = true,
+          useany = true,
+        },
+        completeUnimported = true,
+        gofumpt = true,
+        hints = {
+          assignVariableTypes = true,
+          compositeLiteralFields = true,
+          compositeLiteralTypes = true,
+          constantValues = true,
+          functionTypeParameters = true,
+          parameterNames = true,
+          rangeVariableTypes = true,
+        },
+        staticcheck = true,
+      },
+    },
+  },
+  html = {
+    cmd = html_cmd and { html_cmd, "--stdio" } or nil,
+    filetypes = { "html" },
+  },
+  cssls = {
+    cmd = css_cmd and { css_cmd, "--stdio" } or nil,
+    filetypes = { "css", "scss", "less" },
+    root_dir = resolve_root({ "package.json", ".git" }, true),
+    settings = {
+      css = {
+        lint = {
+          unknownAtRules = "ignore",
+        },
+      },
+      scss = {
+        lint = {
+          unknownAtRules = "ignore",
+        },
+      },
+      less = {
+        lint = {
+          unknownAtRules = "ignore",
+        },
+      },
+    },
+  },
+  tailwindcss = {
+    cmd = tailwindcss_cmd and { tailwindcss_cmd, "--stdio" } or nil,
+    filetypes = {
+      "css",
+      "scss",
+      "sass",
+      "html",
+      "razor",
+      "javascriptreact",
+      "typescriptreact",
+    },
+    root_dir = resolve_root({
+      "tailwind.config.js",
+      "tailwind.config.cjs",
+      "tailwind.config.mjs",
+      "tailwind.config.ts",
+      "postcss.config.js",
+      "postcss.config.cjs",
+      "postcss.config.mjs",
+      "postcss.config.ts",
+      "package.json",
+      ".git",
+    }, true),
+    settings = {
+      tailwindCSS = {
+        includeLanguages = {
+          razor = "html",
+          cshtml = "html",
+        },
+      },
+    },
+  },
+  marksman = {
+    cmd = marksman_cmd and { marksman_cmd, "server" } or nil,
+    filetypes = { "markdown" },
+    root_dir = resolve_root({ ".marksman.toml", ".git" }, true),
+  },
+}
+
+if basedpyright_cmd then
+  server_configs.basedpyright = {
+    cmd = { basedpyright_cmd, "--stdio" },
+    root_dir = resolve_root({ "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", ".git" }, true),
+    settings = {
+      basedpyright = {
+        analysis = {
+          autoImportCompletions = true,
+          autoSearchPaths = true,
+          diagnosticMode = "workspace",
+          typeCheckingMode = "basic",
+          useLibraryCodeForTypes = true,
+        },
+      },
+    },
+  }
+end
+
+local base_config = {
+  capabilities = capabilities,
+  on_attach = on_attach,
+  on_init = on_init,
+}
+
+local function attach_servers_to_open_buffers()
+  vim.schedule(function()
+    for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].filetype ~= "" then
+        pcall(vim.api.nvim_exec_autocmds, "FileType", {
+          buffer = bufnr,
+          modeline = false,
+        })
+      end
+    end
+  end)
+end
+
+vim.lsp.config("*", base_config)
+for server, config in pairs(server_configs) do
+  vim.lsp.config(server, config)
+  vim.lsp.enable(server)
+end
+
+attach_servers_to_open_buffers()
+
+-- read :h vim.lsp.config for changing options of lsp servers

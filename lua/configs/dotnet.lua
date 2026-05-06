@@ -1,0 +1,1282 @@
+local M = {}
+
+local paths = require "configs.paths"
+
+local dotnet_filetypes = {
+  cs = true,
+  cshtml = true,
+  razor = true,
+  csproj = true,
+  fsproj = true,
+  sln = true,
+  slnx = true,
+  props = true,
+}
+
+local function ensure_dotnet_tools_on_path()
+  local candidates = {
+    vim.fn.expand "~/.dotnet/tools",
+    vim.fn.expand "~/.dotnet/.dotnet/tools",
+  }
+  local shim_names = paths.is_windows and {
+    "dotnet-easydotnet.exe",
+    "dotnet-easydotnet.cmd",
+    "dotnet-easydotnet",
+  } or {
+    "dotnet-easydotnet",
+  }
+
+  for _, directory in ipairs(candidates) do
+    for _, shim_name in ipairs(shim_names) do
+      local shim = vim.fs.joinpath(directory, shim_name)
+      if vim.uv.fs_stat(shim) then
+        vim.env.PATH = directory .. paths.path_list_sep .. vim.env.PATH
+        return
+      end
+    end
+  end
+end
+
+local function csharpier_path()
+  return paths.first(paths.mason_bin "csharpier", paths.executable "csharpier")
+end
+
+local function roslyn_cmd()
+  local roslyn = paths.first(paths.mason_bin "roslyn", paths.executable "roslyn")
+  if not roslyn then
+    return nil
+  end
+
+  local rzls_root = paths.mason_path("rzls", "libexec")
+  if not rzls_root then
+    return { roslyn, "--stdio" }
+  end
+
+  return {
+    roslyn,
+    "--stdio",
+    "--logLevel=Information",
+    "--extensionLogDirectory=" .. vim.fs.dirname(vim.lsp.get_log_path()),
+    "--razorSourceGenerator=" .. vim.fs.joinpath(rzls_root, "Microsoft.CodeAnalysis.Razor.Compiler.dll"),
+    "--razorDesignTimePath=" .. vim.fs.joinpath(rzls_root, "Targets", "Microsoft.NET.Sdk.Razor.DesignTime.targets"),
+    "--extension",
+    vim.fs.joinpath(rzls_root, "RazorExtension", "Microsoft.VisualStudioCode.RazorExtension.dll"),
+  }
+end
+
+local function rzls_path()
+  return paths.first(paths.mason_bin "rzls", paths.executable "rzls")
+end
+
+local function lsp_capabilities()
+  local nvchad_lsp = require "nvchad.configs.lspconfig"
+  local capabilities = vim.deepcopy(nvchad_lsp.capabilities)
+  local ok_cmp, cmp_nvim_lsp = pcall(require, "cmp_nvim_lsp")
+
+  if ok_cmp then
+    capabilities = cmp_nvim_lsp.default_capabilities(capabilities)
+  end
+
+  capabilities.textDocument = vim.tbl_deep_extend("force", capabilities.textDocument or {}, {
+    codeLens = {
+      dynamicRegistration = true,
+    },
+    diagnostic = {
+      dynamicRegistration = true,
+    },
+    foldingRange = {
+      dynamicRegistration = false,
+      lineFoldingOnly = true,
+    },
+  })
+  capabilities.workspace = vim.tbl_deep_extend("force", capabilities.workspace or {}, {
+    didChangeWatchedFiles = {
+      dynamicRegistration = true,
+    },
+  })
+
+  return capabilities
+end
+
+local setup_rzls
+
+local function on_attach(client, bufnr)
+  local nvchad_lsp = require "nvchad.configs.lspconfig"
+  nvchad_lsp.on_attach(client, bufnr)
+  vim.bo[bufnr].omnifunc = "v:lua.vim.lsp.omnifunc"
+end
+
+local function solution_candidates(directory)
+  local matches = {}
+
+  for _, pattern in ipairs { "*.sln", "*.slnx" } do
+    for _, path in ipairs(vim.fn.globpath(directory, pattern, false, true)) do
+      table.insert(matches, vim.fs.normalize(path))
+    end
+  end
+
+  table.sort(matches)
+
+  return matches
+end
+
+local function parent_directory(path)
+  local parent = vim.fs.dirname(path)
+  if parent == path then
+    return nil
+  end
+
+  return parent
+end
+
+local function nearest_solution(path, selected_solution)
+  if path == "" then
+    return nil
+  end
+
+  if path:match("%.slnx?$") then
+    return vim.fs.normalize(path)
+  end
+
+  local directory = vim.fs.dirname(vim.fs.normalize(path))
+
+  while directory do
+    local candidates = solution_candidates(directory)
+
+    if #candidates == 1 then
+      return candidates[1]
+    end
+
+    if #candidates > 1 then
+      local normalized_selected = selected_solution and vim.fs.normalize(selected_solution) or nil
+      if normalized_selected and vim.tbl_contains(candidates, normalized_selected) then
+        return normalized_selected
+      end
+
+      return nil
+    end
+
+    directory = parent_directory(directory)
+  end
+
+  return nil
+end
+
+local function solution_targets(path)
+  if path == "" then
+    return {}
+  end
+
+  local results = {}
+  local seen = {}
+  local directory = path:match("%.slnx?$") and vim.fs.dirname(vim.fs.normalize(path)) or vim.fs.dirname(vim.fs.normalize(path))
+
+  while directory do
+    for _, candidate in ipairs(solution_candidates(directory)) do
+      if not seen[candidate] then
+        seen[candidate] = true
+        table.insert(results, candidate)
+      end
+    end
+
+    directory = parent_directory(directory)
+  end
+
+  table.sort(results)
+
+  return results
+end
+
+local function stop_client_group(names)
+  local clients = vim.tbl_filter(function(client)
+    return names[client.name] == true
+  end, vim.lsp.get_clients())
+
+  if #clients == 0 then
+    return false
+  end
+
+  vim.lsp.stop_client(vim.tbl_map(function(client)
+    return client.id
+  end, clients), true)
+
+  return true
+end
+
+local suppress_roslyn_stop_notice = false
+
+local function start_roslyn_for_buffer(bufnr)
+  local config = vim.lsp.config.roslyn
+  if not config or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then
+    return
+  end
+
+  local ft = vim.bo[bufnr].filetype
+  if ft ~= "cs" and ft ~= "razor" and ft ~= "cshtml" then
+    return
+  end
+
+  local existing = vim.lsp.get_clients { bufnr = bufnr, name = "roslyn" }
+  if #existing > 0 then
+    return
+  end
+
+  pcall(vim.lsp.start, config, { bufnr = bufnr })
+end
+
+local function refresh_dotnet_buffers()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_buf_is_loaded(buf) then
+      local ft = vim.bo[buf].filetype
+      if ft == "razor" or ft == "cshtml" or ft == "cs" then
+        vim.api.nvim_exec_autocmds("FileType", {
+          buffer = buf,
+          modeline = false,
+          data = { filetype = ft },
+        })
+      end
+    end
+  end
+end
+
+local function restart_dotnet_lsp(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  local current_win = vim.api.nvim_get_current_win()
+  suppress_roslyn_stop_notice = true
+  local stopped = stop_client_group {
+    roslyn = true,
+    rzls = true,
+    aftershave = true,
+  }
+
+  if not stopped and not dotnet_filetypes[vim.bo[bufnr].filetype] then
+    return false
+  end
+
+  vim.defer_fn(function()
+    suppress_roslyn_stop_notice = false
+    if not vim.api.nvim_buf_is_valid(bufnr) then
+      return
+    end
+
+    setup_rzls()
+    vim.lsp.enable "roslyn"
+
+    if vim.api.nvim_win_is_valid(current_win) then
+      pcall(vim.api.nvim_set_current_win, current_win)
+    end
+
+    if path ~= "" and vim.uv.fs_stat(path) then
+      vim.cmd "silent! edit"
+    else
+      vim.api.nvim_exec_autocmds("BufEnter", { buffer = bufnr })
+    end
+
+    refresh_dotnet_buffers()
+  end, 100)
+
+  return true
+end
+
+function M.sync_easy_dotnet_solution(bufnr)
+  local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
+  if not ok then
+    return false
+  end
+
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+  if not dotnet_filetypes[vim.bo[bufnr].filetype] then
+    return false
+  end
+
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then
+    return false
+  end
+
+  local selected_solution = current_solution.try_get_selected_solution()
+  local solution = nearest_solution(path, selected_solution)
+  if not solution then
+    if selected_solution then
+      local ok_clear = pcall(current_solution.clear_selected_solution)
+      if ok_clear then
+        restart_dotnet_lsp(bufnr)
+      end
+      return ok_clear
+    end
+    return false
+  end
+
+  if solution == selected_solution then
+    return false
+  end
+
+  local ok_set = pcall(current_solution.set_solution, solution)
+  if ok_set then
+    restart_dotnet_lsp(bufnr)
+  end
+  return ok_set
+end
+
+local function active_dotnet_root(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+  if path == "" then
+    return nil
+  end
+
+  local selected_solution = nil
+  local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
+  if ok then
+    selected_solution = current_solution.try_get_selected_solution()
+  end
+
+  local solution = nearest_solution(path, selected_solution)
+  if solution then
+    return vim.fs.dirname(solution)
+  end
+
+  return vim.fs.dirname(vim.fs.normalize(path))
+end
+
+setup_rzls = function()
+  local ok_rzls, rzls = pcall(require, "rzls")
+  if not ok_rzls then
+    return
+  end
+
+  vim.api.nvim_create_autocmd({ "BufReadPre", "BufNewFile" }, {
+    group = vim.api.nvim_create_augroup("UserRazorVirtualBuffers", { clear = true }),
+    pattern = { "*__virtual.cs", "*__virtual.html" },
+    callback = function(args)
+      vim.bo[args.buf].swapfile = false
+      vim.bo[args.buf].undofile = false
+      vim.bo[args.buf].bufhidden = "wipe"
+    end,
+  })
+
+  local cwd = vim.fn.getcwd()
+  local root = active_dotnet_root()
+  if root and root ~= "" then
+    vim.fn.chdir(root)
+  end
+
+  rzls.setup {
+    capabilities = lsp_capabilities(),
+    on_attach = on_attach,
+    path = rzls_path(),
+  }
+
+  if root and root ~= "" then
+    vim.fn.chdir(cwd)
+  end
+end
+
+local function easy_dotnet_lsp_settings()
+  return {
+    ["csharp|background_analysis"] = {
+      dotnet_analyzer_diagnostics_scope = "openFiles",
+      dotnet_compiler_diagnostics_scope = "openFiles",
+    },
+    ["csharp|code_lens"] = {
+      dotnet_enable_references_code_lens = true,
+      dotnet_enable_tests_code_lens = true,
+    },
+    ["csharp|completion"] = {
+      dotnet_provide_regex_completions = true,
+      dotnet_show_completion_items_from_unimported_namespaces = true,
+      dotnet_show_name_completion_suggestions = true,
+    },
+    ["csharp|formatting"] = {
+      dotnet_organize_imports_on_format = true,
+    },
+    ["csharp|inlay_hints"] = {
+      csharp_enable_inlay_hints_for_implicit_object_creation = true,
+      csharp_enable_inlay_hints_for_implicit_variable_types = true,
+      csharp_enable_inlay_hints_for_lambda_parameter_types = true,
+      csharp_enable_inlay_hints_for_types = true,
+      dotnet_enable_inlay_hints_for_indexer_parameters = true,
+      dotnet_enable_inlay_hints_for_literal_parameters = true,
+      dotnet_enable_inlay_hints_for_object_creation_parameters = true,
+      dotnet_enable_inlay_hints_for_other_parameters = true,
+      dotnet_enable_inlay_hints_for_parameters = true,
+      dotnet_suppress_inlay_hints_for_parameters_that_differ_only_by_suffix = true,
+      dotnet_suppress_inlay_hints_for_parameters_that_match_argument_name = true,
+      dotnet_suppress_inlay_hints_for_parameters_that_match_method_intent = true,
+    },
+    ["csharp|symbol_search"] = {
+      dotnet_search_reference_assemblies = true,
+    },
+  }
+end
+
+local function bridge_easy_dotnet_to_rzls()
+  local ok_constants, constants = pcall(require, "easy-dotnet.constants")
+  if ok_constants then
+    constants.lsp_client_name = "roslyn"
+  end
+
+  local ok_razor, razor = pcall(require, "rzls.razor")
+  if ok_razor then
+    razor.lsp_names[razor.language_kinds.csharp] = "roslyn"
+  end
+end
+
+local function mark_roslyn_initialized()
+  local config = vim.lsp.config.roslyn
+  if not config or not config.handlers then
+    return
+  end
+
+  local original = config.handlers["workspace/projectInitializationComplete"]
+  if not original or config.handlers._user_roslyn_ready_wrapped then
+    return
+  end
+
+  config.handlers._user_roslyn_ready_wrapped = true
+  config.handlers["workspace/projectInitializationComplete"] = function(err, result, ctx, handler_config)
+    _G.roslyn_initialized = true
+    vim.api.nvim_exec_autocmds("User", { pattern = "RoslynInitialized" })
+    return original(err, result, ctx, handler_config)
+  end
+end
+
+local function nearest_project(path)
+  if path == "" then
+    return nil
+  end
+
+  local directory = vim.fs.dirname(vim.fs.normalize(path))
+  local matches = vim.fs.find(function(name)
+    return name:match("%.csproj$") or name:match("%.fsproj$")
+  end, {
+    path = directory,
+    upward = true,
+    limit = 1,
+  })
+
+  return matches[1]
+end
+
+local function diagnostic_include_warnings(severity_filter)
+  if not severity_filter then
+    severity_filter = require("easy-dotnet.options").options.diagnostics.default_severity
+  end
+
+  return severity_filter ~= "error"
+end
+
+local function diagnostic_filter()
+  return function(filename)
+    local normalized = filename:gsub("\\", "/")
+    return (normalized:match "%.cs$" or normalized:match "%.fs$")
+      and not normalized:match "/obj/"
+      and not normalized:match "/bin/"
+  end
+end
+
+local function selected_diagnostic_target(bufnr)
+  local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
+  if ok then
+    local selected = current_solution.try_get_selected_solution()
+    if selected then
+      return selected
+    end
+  end
+
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local path = vim.api.nvim_buf_get_name(bufnr)
+
+  local solution = nearest_solution(path)
+  if solution then
+    return solution
+  end
+
+  return nearest_project(path)
+end
+
+local function override_easy_dotnet_diagnostics()
+  local ok_actions, actions = pcall(require, "easy-dotnet.actions.diagnostics")
+  if not ok_actions then
+    return
+  end
+
+  local original = actions.get_workspace_diagnostics
+
+  actions.get_workspace_diagnostics = function(severity_filter)
+    local target = selected_diagnostic_target()
+    if not target then
+      return original(severity_filter)
+    end
+
+    local rpc = require "easy-dotnet.rpc.rpc"
+    local diagnostics = require "easy-dotnet.diagnostics"
+
+    rpc.global_rpc_client:initialize(function()
+      rpc.global_rpc_client.roslyn:get_workspace_diagnostics(
+        target,
+        diagnostic_include_warnings(severity_filter),
+        function(response)
+          diagnostics.populate_diagnostics(response, diagnostic_filter())
+        end
+      )
+    end)
+  end
+end
+
+local function default_task_from_prompt(prompt)
+  if type(prompt) ~= "string" then
+    return nil
+  end
+
+  local lower = prompt:lower()
+
+  if lower:match "pick project to build" then
+    return "build"
+  end
+
+  if lower:match "pick project to run" then
+    return "run"
+  end
+
+  if lower:match "pick project to test" then
+    return "test"
+  end
+
+  if lower:match "pick test project" then
+    return "test"
+  end
+
+  if lower:match "pick project to watch" then
+    return "watch"
+  end
+
+  if lower:match "pick project to view" then
+    return "view"
+  end
+
+  return nil
+end
+
+local function persisted_default_project_name(solution, task_type)
+  local ok_default, default_manager = pcall(require, "easy-dotnet.default-manager")
+  if not ok_default or not solution or not task_type then
+    return nil
+  end
+
+  local cache_file = default_manager.try_get_cache_file(solution)
+  if not cache_file or vim.fn.filereadable(cache_file) ~= 1 then
+    return nil
+  end
+
+  local ok_read, lines = pcall(vim.fn.readfile, cache_file)
+  if not ok_read then
+    return nil
+  end
+
+  local ok_decode, decoded = pcall(vim.fn.json_decode, table.concat(lines, "\n"))
+  if not ok_decode or type(decoded) ~= "table" then
+    return nil
+  end
+
+  local key = string.format("default_%s_project", task_type)
+  local persisted = decoded[key]
+
+  if type(persisted) == "string" then
+    return persisted ~= "Solution" and persisted or nil
+  end
+
+  if type(persisted) == "table" and persisted.type == "project" then
+    return persisted.project
+  end
+
+  return nil
+end
+
+local function default_picker_choice(items, prompt)
+  local task_type = default_task_from_prompt(prompt)
+  if not task_type then
+    return nil
+  end
+
+  local ok_solution, current_solution = pcall(require, "easy-dotnet.current_solution")
+  if not ok_solution then
+    return nil
+  end
+
+  local project_name = persisted_default_project_name(current_solution.try_get_selected_solution(), task_type)
+  if not project_name then
+    return nil
+  end
+
+  for _, item in ipairs(items or {}) do
+    if type(item) == "table" and type(item.display) == "string" then
+      if item.display == project_name or item.display:match("^" .. vim.pesc(project_name) .. "%s*%(") then
+        return item
+      end
+    end
+  end
+
+  return nil
+end
+
+local function override_easy_dotnet_picker_defaults()
+  local ok_picker, picker = pcall(require, "easy-dotnet.picker")
+  if not ok_picker or picker._user_default_wrapped then
+    return
+  end
+
+  picker._user_default_wrapped = true
+
+  local original_picker = picker.picker
+  local original_preview_picker = picker.preview_picker
+
+  picker.picker = function(_, items, on_choice, prompt, ...)
+    local choice = default_picker_choice(items, prompt)
+    if choice then
+      on_choice(choice)
+      return
+    end
+
+    return original_picker(_, items, on_choice, prompt, ...)
+  end
+
+  picker.preview_picker = function(_, items, on_choice, prompt, ...)
+    local choice = default_picker_choice(items, prompt)
+    if choice then
+      on_choice(choice)
+      return
+    end
+
+    return original_preview_picker(_, items, on_choice, prompt, ...)
+  end
+end
+
+local function override_easy_dotnet_secrets()
+  local ok_secrets, secrets = pcall(require, "easy-dotnet.secrets")
+  if not ok_secrets or secrets._user_recursive_wrapped then
+    return
+  end
+
+  secrets._user_recursive_wrapped = true
+
+  local original = secrets.edit_secrets_picker
+  secrets.edit_secrets_picker = function(get_secret_path)
+    local function ensure_secret_path(secret_id)
+      local path = get_secret_path(secret_id)
+      local parent = path and vim.fs.dirname(path) or nil
+      if parent and parent ~= "" then
+        vim.fn.mkdir(parent, "p")
+      end
+      return path
+    end
+
+    return original(ensure_secret_path)
+  end
+end
+
+local function override_easy_dotnet_workspace_warning()
+  local ok_logger, logger = pcall(require, "easy-dotnet.logger")
+  if not ok_logger or logger._user_workspace_warning_wrapped then
+    return
+  end
+
+  logger._user_workspace_warning_wrapped = true
+
+  local original_warn = logger.warn
+  logger.warn = function(msg)
+    if msg == "Active file is not part of the workspace. IntelliSense may be limited." then
+      local bufnr = vim.api.nvim_get_current_buf()
+      local ft = vim.bo[bufnr].filetype
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if ft == "razor" or ft == "cshtml" or name:match "__virtual%." then
+        return
+      end
+    end
+
+    return original_warn(msg)
+  end
+end
+
+local function override_easy_dotnet_root_dir()
+  local ok_client, dotnet_client = pcall(require, "easy-dotnet.rpc.dotnet-client")
+  if not ok_client or dotnet_client._user_root_wrapped then
+    return
+  end
+
+  dotnet_client._user_root_wrapped = true
+
+  function dotnet_client:_initialize(cb, opts)
+    opts = opts or {}
+
+    coroutine.wrap(function()
+      local current_solution = require "easy-dotnet.current_solution"
+      local use_visual_studio = require("easy-dotnet.options").options.server.use_visual_studio == true
+      local debugger_path = require("easy-dotnet.options").options.debugger.bin_path
+      local ext_terminal = require("easy-dotnet.options").options.external_terminal
+      local apply_value_converters = require("easy-dotnet.options").options.debugger.apply_value_converters
+      local debugger_options = {
+        applyValueConverters = apply_value_converters,
+        binaryPath = debugger_path,
+      }
+
+      local bufnr = vim.api.nvim_get_current_buf()
+      local path = vim.api.nvim_buf_get_name(bufnr)
+      local selected_solution = current_solution.try_get_selected_solution()
+      local sln_file = path ~= "" and nearest_solution(path, selected_solution) or selected_solution
+
+      if sln_file and sln_file ~= selected_solution then
+        pcall(current_solution.set_solution, sln_file)
+      elseif not sln_file and path ~= "" then
+        pcall(current_solution.clear_selected_solution)
+      end
+
+      local root_dir = active_dotnet_root() or (sln_file and vim.fs.dirname(sln_file)) or vim.fs.normalize(vim.fn.getcwd())
+
+      dotnet_client.create_rpc_call({
+        client = self._client,
+        job = {
+          name = "Initializing...",
+          on_success_text = "Client initialized",
+          on_error_text = "Failed to initialize server",
+        },
+        cb = cb,
+        on_crash = opts.on_crash,
+        method = "initialize",
+        params = {
+          request = {
+            clientInfo = {
+              name = "EasyDotnet",
+              version = "3.0.0",
+              pid = vim.fn.getpid(),
+            },
+            projectInfo = {
+              rootDir = vim.fs.normalize(root_dir),
+              solutionFile = sln_file,
+            },
+            options = {
+              useVisualStudio = use_visual_studio,
+              debuggerOptions = debugger_options,
+              externalTerminal = ext_terminal,
+            },
+          },
+        },
+      })()
+    end)()
+  end
+end
+
+local function override_easy_dotnet_roslyn_root_dir()
+  local config = vim.lsp.config.roslyn
+  if not config then
+    return
+  end
+
+  config.root_dir = function(bufnr, on_dir)
+    local path = vim.api.nvim_buf_get_name(bufnr)
+    if path == "" then
+      on_dir(vim.fs.normalize(vim.fn.getcwd()))
+      return
+    end
+
+    local selected_solution = nil
+    local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
+    if ok then
+      selected_solution = current_solution.try_get_selected_solution()
+    end
+
+    local solution = nearest_solution(path, selected_solution)
+    if ok then
+      if solution and solution ~= selected_solution then
+        pcall(current_solution.set_solution, solution)
+      elseif not solution and selected_solution then
+        pcall(current_solution.clear_selected_solution)
+      end
+    end
+
+    if solution then
+      on_dir(vim.fs.dirname(solution))
+      return
+    end
+
+    local project = nearest_project(path)
+    if project then
+      on_dir(vim.fs.dirname(project))
+      return
+    end
+
+    on_dir(vim.fs.dirname(vim.fs.normalize(path)))
+  end
+end
+
+local function terminal_output_lines(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return {}
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  while #lines > 1 and lines[#lines] == "" and lines[#lines - 1] == "" do
+    table.remove(lines)
+  end
+
+  return lines
+end
+
+local function close_rendered_buffer(state)
+  if not state or not state.rendered_buf or not vim.api.nvim_buf_is_valid(state.rendered_buf) then
+    return
+  end
+
+  pcall(vim.api.nvim_buf_delete, state.rendered_buf, { force = true })
+  state.rendered_buf = nil
+end
+
+local function create_rendered_terminal_buffer(lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].buflisted = false
+  vim.bo[buf].modifiable = true
+  vim.bo[buf].filetype = "log"
+
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+
+  vim.bo[buf].modifiable = false
+
+  vim.keymap.set("n", "q", function()
+    local win = vim.fn.bufwinid(buf)
+    if win ~= -1 and vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, false)
+    end
+  end, { buffer = buf, nowait = true, silent = true })
+
+  return buf
+end
+
+local function render_easy_dotnet_terminal_output(state)
+  if not state then
+    return
+  end
+
+  local lines = terminal_output_lines(state.buf)
+  if #lines == 0 then
+    return
+  end
+
+  close_rendered_buffer(state)
+
+  local rendered = create_rendered_terminal_buffer(lines)
+  state.rendered_buf = rendered
+
+  if state.win and vim.api.nvim_win_is_valid(state.win) then
+    require("easy-dotnet.terminal.header").cleanup_header()
+    vim.api.nvim_win_set_buf(state.win, rendered)
+    vim.api.nvim_win_set_cursor(state.win, { 1, 0 })
+    vim.fn.win_execute(state.win, "normal! zt")
+    vim.cmd "redraw!"
+  end
+end
+
+local function override_easy_dotnet_terminal()
+  local ok_terminal, terminal = pcall(require, "easy-dotnet.terminal")
+  if not ok_terminal or terminal._user_render_wrapped then
+    return
+  end
+
+  -- Newer easy-dotnet.nvim releases replaced the old terminal.state/header
+  -- internals that this local override customized. On those versions, keep the
+  -- plugin's native terminal behavior instead of trying to patch removed APIs.
+  if type(terminal.state) ~= "table" then
+    return
+  end
+
+  local ok_header, header = pcall(require, "easy-dotnet.terminal.header")
+  if not ok_header then
+    return
+  end
+
+  terminal._user_render_wrapped = true
+
+  local state = terminal.state
+  local original_show = terminal.show
+
+  terminal.show = function()
+    if state.last_status == "finished" and state.rendered_buf and vim.api.nvim_buf_is_valid(state.rendered_buf) then
+      if state.win and vim.api.nvim_win_is_valid(state.win) then
+        vim.api.nvim_set_current_win(state.win)
+      else
+        vim.cmd "split"
+        state.win = vim.api.nvim_get_current_win()
+        vim.w[state.win].easy_dotnet_terminal = true
+
+        vim.api.nvim_create_autocmd("WinClosed", {
+          pattern = tostring(state.win),
+          callback = function()
+            state.win = nil
+            header.cleanup_header()
+          end,
+          once = true,
+        })
+      end
+
+      vim.api.nvim_win_set_buf(state.win, state.rendered_buf)
+      vim.api.nvim_win_set_cursor(state.win, { 1, 0 })
+      vim.fn.win_execute(state.win, "normal! zt")
+      header.cleanup_header()
+      vim.cmd "redraw!"
+      return
+    end
+
+    close_rendered_buffer(state)
+    return original_show()
+  end
+
+  local group = vim.api.nvim_create_augroup("UserEasyDotnetTerminalRender", { clear = true })
+
+  vim.api.nvim_create_autocmd("TermClose", {
+    group = group,
+    callback = function(args)
+      if args.buf ~= state.buf then
+        return
+      end
+
+      vim.defer_fn(function()
+        render_easy_dotnet_terminal_output(state)
+      end, 20)
+    end,
+  })
+end
+
+local function override_easy_dotnet_roslyn_filetypes()
+  local config = vim.lsp.config.roslyn
+  if not config then
+    return
+  end
+
+  config.filetypes = { "cs" }
+end
+
+local function override_easy_dotnet_roslyn_on_exit()
+  local config = vim.lsp.config.roslyn
+  if not config or config._user_on_exit_wrapped then
+    return
+  end
+
+  config._user_on_exit_wrapped = true
+  local original = config.on_exit
+
+  config.on_exit = function(code, signal, client_id)
+    if suppress_roslyn_stop_notice and (code == 0 or code == 143) then
+      return
+    end
+
+    if original then
+      return original(code, signal, client_id)
+    end
+  end
+end
+
+local function disable_aftershave_semantic_tokens()
+  local group = vim.api.nvim_create_augroup("UserDotnetAftershaveSemanticTokens", { clear = true })
+
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = group,
+    callback = function(args)
+      local client_id = args.data and args.data.client_id
+      if not client_id then
+        return
+      end
+
+      local client = vim.lsp.get_client_by_id(client_id)
+      if not client or client.name ~= "aftershave" then
+        return
+      end
+
+      client.server_capabilities.semanticTokensProvider = nil
+      pcall(vim.lsp.semantic_tokens.stop, args.buf, client.id)
+    end,
+  })
+end
+
+local function create_roslyn_commands()
+  if vim.g.user_dotnet_roslyn_command_created then
+    return
+  end
+
+  vim.g.user_dotnet_roslyn_command_created = true
+
+  vim.api.nvim_create_user_command("Roslyn", function(opts)
+    local subcommand = opts.fargs[1]
+
+    if subcommand == "target" then
+      local path = vim.api.nvim_buf_get_name(0)
+      local targets = solution_targets(path)
+
+      if #targets == 0 then
+        vim.notify("No .sln or .slnx files found for this buffer", vim.log.levels.WARN)
+        return
+      end
+
+      vim.ui.select(targets, {
+        prompt = "Select target solution: ",
+        format_item = function(item)
+          return vim.fn.fnamemodify(item, ":.")
+        end,
+      }, function(choice)
+        if not choice then
+          return
+        end
+
+        require("easy-dotnet.current_solution").set_solution(choice)
+        restart_dotnet_lsp()
+        vim.notify("Selected solution: " .. vim.fs.basename(choice), vim.log.levels.INFO)
+      end)
+      return
+    end
+
+    if subcommand == "restart" then
+      restart_dotnet_lsp()
+      return
+    end
+
+    vim.notify("Roslyn: expected `target` or `restart`", vim.log.levels.ERROR)
+  end, {
+    nargs = 1,
+    desc = "Interact with the C# Roslyn workspace",
+    complete = function(arg_lead)
+      return vim.tbl_filter(function(item)
+        return item:find(arg_lead, 1, true) == 1
+      end, { "target", "restart" })
+    end,
+  })
+end
+
+function M.setup_roslyn()
+  local config = {
+    cmd = roslyn_cmd(),
+    capabilities = lsp_capabilities(),
+    on_attach = on_attach,
+    settings = {
+      razor = {
+        language_server = {
+          cohosting_enabled = true,
+        },
+      },
+      ["csharp|background_analysis"] = {
+        dotnet_analyzer_diagnostics_scope = "openFiles",
+        dotnet_compiler_diagnostics_scope = "openFiles",
+      },
+      ["csharp|code_lens"] = {
+        dotnet_enable_references_code_lens = true,
+        dotnet_enable_tests_code_lens = true,
+      },
+      ["csharp|completion"] = {
+        dotnet_provide_regex_completions = true,
+        dotnet_show_completion_items_from_unimported_namespaces = true,
+        dotnet_show_name_completion_suggestions = true,
+      },
+      ["csharp|formatting"] = {
+        dotnet_organize_imports_on_format = true,
+      },
+      ["csharp|inlay_hints"] = {
+        csharp_enable_inlay_hints_for_implicit_object_creation = true,
+        csharp_enable_inlay_hints_for_implicit_variable_types = true,
+        csharp_enable_inlay_hints_for_lambda_parameter_types = true,
+        csharp_enable_inlay_hints_for_types = true,
+        dotnet_enable_inlay_hints_for_indexer_parameters = true,
+        dotnet_enable_inlay_hints_for_literal_parameters = true,
+        dotnet_enable_inlay_hints_for_object_creation_parameters = true,
+        dotnet_enable_inlay_hints_for_other_parameters = true,
+        dotnet_enable_inlay_hints_for_parameters = true,
+        dotnet_suppress_inlay_hints_for_parameters_that_differ_only_by_suffix = true,
+        dotnet_suppress_inlay_hints_for_parameters_that_match_argument_name = true,
+        dotnet_suppress_inlay_hints_for_parameters_that_match_method_intent = true,
+      },
+      ["csharp|symbol_search"] = {
+        dotnet_search_reference_assemblies = true,
+      },
+    },
+  }
+
+  local ok_rzls, roslyn_handlers = pcall(require, "rzls.roslyn_handlers")
+  if ok_rzls then
+    config.handlers = roslyn_handlers
+  end
+
+  vim.lsp.config("roslyn", config)
+  setup_rzls()
+
+  require("roslyn").setup {
+    broad_search = true,
+    filewatching = "auto",
+    lock_target = false,
+    silent = false,
+  }
+end
+
+function M.setup_easy_dotnet()
+  ensure_dotnet_tools_on_path()
+  bridge_easy_dotnet_to_rzls()
+
+  do
+    local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
+    if ok then
+      local bufnr = vim.api.nvim_get_current_buf()
+      local path = vim.api.nvim_buf_get_name(bufnr)
+      if path ~= "" then
+        local selected_solution = current_solution.try_get_selected_solution()
+        local solution = nearest_solution(path, selected_solution)
+        if solution and solution ~= selected_solution then
+          pcall(current_solution.set_solution, solution)
+        elseif not solution then
+          pcall(current_solution.clear_selected_solution)
+        end
+      end
+    end
+  end
+
+  require("easy-dotnet").setup {
+    picker = "telescope",
+    managed_terminal = {
+      auto_hide = false,
+      auto_hide_delay = 0,
+    },
+    lsp = {
+      enabled = true,
+      preload_roslyn = true,
+      roslynator_enabled = true,
+      easy_dotnet_analyzer_enabled = true,
+      config = {
+        settings = easy_dotnet_lsp_settings(),
+      },
+    },
+    debugger = {
+      auto_register_dap = false,
+      bin_path = paths.first(paths.mason_path("netcoredbg", "netcoredbg"), paths.executable "netcoredbg"),
+    },
+    diagnostics = {
+      default_severity = "warning",
+      setqflist = false,
+    },
+    new = {
+      project = {
+        prefix = "sln",
+      },
+    },
+  }
+
+  override_easy_dotnet_root_dir()
+  override_easy_dotnet_picker_defaults()
+  override_easy_dotnet_diagnostics()
+  override_easy_dotnet_secrets()
+  override_easy_dotnet_workspace_warning()
+  override_easy_dotnet_terminal()
+  override_easy_dotnet_roslyn_root_dir()
+  override_easy_dotnet_roslyn_filetypes()
+  override_easy_dotnet_roslyn_on_exit()
+  disable_aftershave_semantic_tokens()
+  create_roslyn_commands()
+  mark_roslyn_initialized()
+  setup_rzls()
+
+  local group = vim.api.nvim_create_augroup("UserEasyDotnetSolution", { clear = true })
+
+  vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "DirChanged", "VimEnter" }, {
+    group = group,
+    callback = function(args)
+      M.sync_easy_dotnet_solution(args.buf or 0)
+    end,
+  })
+
+  M.sync_easy_dotnet_solution()
+end
+
+function M.extend_cmp(opts)
+  local cmp = require "cmp"
+  local source_name = "easy-dotnet"
+
+  cmp.register_source(source_name, require("easy-dotnet").package_completion_source)
+
+  for _, source in ipairs(opts.sources or {}) do
+    if source.name == source_name then
+      return opts
+    end
+  end
+
+  table.insert(opts.sources, 2, { name = source_name })
+
+  return opts
+end
+
+function M.format_buffer(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+
+  if vim.bo[bufnr].filetype ~= "cs" then
+    require("conform").format {
+      async = false,
+      lsp_fallback = true,
+      buf = bufnr,
+    }
+    return true
+  end
+
+  local filename = vim.api.nvim_buf_get_name(bufnr)
+  local csharpier = csharpier_path()
+
+  if filename == "" or not csharpier then
+    vim.notify("C# formatting requires a saved file and csharpier", vim.log.levels.WARN)
+    return false
+  end
+
+  local text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
+  if vim.bo[bufnr].endofline then
+    text = text .. "\n"
+  end
+
+  local result = vim
+    .system({
+      csharpier,
+      "format",
+      "--write-stdout",
+      "--stdin-path",
+      filename,
+    }, {
+      stdin = text,
+      text = true,
+    })
+    :wait()
+
+  if result.code ~= 0 then
+    local message = result.stderr ~= "" and result.stderr or result.stdout
+    vim.notify(message ~= "" and message or "csharpier failed", vim.log.levels.ERROR)
+    return false
+  end
+
+  local formatted_lines = vim.split(result.stdout, "\n", { plain = true })
+  if formatted_lines[#formatted_lines] == "" then
+    table.remove(formatted_lines)
+  end
+
+  local view = vim.fn.winsaveview()
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, formatted_lines)
+  vim.fn.winrestview(view)
+
+  return true
+end
+
+return M

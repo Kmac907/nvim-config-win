@@ -1,0 +1,32 @@
+return {
+  ensure_installed = {
+    "lua",
+    "vim",
+    "vimdoc",
+    "go",
+    "gomod",
+    "gowork",
+    "gosum",
+    "c_sharp",
+    "css",
+    "html",
+    "rust",
+    "python",
+    "powershell",
+    "toml",
+    "json",
+    "xml",
+    "yaml",
+    "bash",
+    "markdown",
+    "markdown_inline",
+    "sql",
+  },
+  auto_install = true,
+  highlight = {
+    enable = true,
+  },
+  indent = {
+    enable = true,
+  },
+}
