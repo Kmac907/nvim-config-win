@@ -1,2 +1,2 @@
 # nvim-config
-my nvim config for ubuntu
+my nvim config for windows
