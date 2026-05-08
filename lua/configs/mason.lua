@@ -23,7 +23,7 @@ M.ensure_installed = {
   "html-lsp",
   "powershell-editor-services",
   "delve",
-  "rzls",
+  "roslyn",
   "csharpier",
   "netcoredbg",
   "rust-analyzer",

@@ -1,4 +1,6 @@
 return {
+  -- Keep parser installs under nvim-data/site instead of relying on implicit defaults.
+  install_dir = vim.fs.joinpath(vim.fn.stdpath "data", "site"),
   ensure_installed = {
     "lua",
     "vim",
@@ -10,6 +12,7 @@ return {
     "c_sharp",
     "css",
     "html",
+    "razor",
     "rust",
     "python",
     "powershell",

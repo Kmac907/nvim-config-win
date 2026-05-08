@@ -6,7 +6,7 @@
 local M = {}
 
 M.base46 = {
-	theme = "gruvbox",
+	theme = "onedark-deep",
 
 	hl_override = {
 		IblChar = { fg = "#d79921" },

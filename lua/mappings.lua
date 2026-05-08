@@ -17,8 +17,19 @@ map("n", "gr", vim.lsp.buf.references, { desc = "References" })
 map("n", "gi", vim.lsp.buf.implementation, { desc = "Implementation" })
 map("n", "K", vim.lsp.buf.hover, { desc = "Hover" })
 map("n", "<leader>li", function()
-  local enabled = vim.lsp.inlay_hint.is_enabled()
-  vim.lsp.inlay_hint.enable(not enabled)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local ft = vim.bo[bufnr].filetype
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  local is_razor_buffer = ft == "razor" or ft == "cshtml" or bufname:match "__virtual%."
+
+  if is_razor_buffer then
+    vim.notify("Inlay hints are disabled for Razor buffers", vim.log.levels.INFO)
+    pcall(vim.lsp.inlay_hint.enable, false, { bufnr = bufnr })
+    return
+  end
+
+  local enabled = vim.lsp.inlay_hint.is_enabled { bufnr = bufnr }
+  vim.lsp.inlay_hint.enable(not enabled, { bufnr = bufnr })
 end, { desc = "Toggle inlay hints" })
 
 map("n", "<leader>xx", "<cmd>Trouble diagnostics toggle<cr>", { desc = "Diagnostics" })

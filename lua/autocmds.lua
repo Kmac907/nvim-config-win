@@ -90,3 +90,70 @@ vim.api.nvim_create_autocmd("FileType", {
     vim.opt_local.concealcursor = "nc"
   end,
 })
+
+vim.api.nvim_create_autocmd("FileType", {
+  group = vim.api.nvim_create_augroup("UserRazorHighlighting", { clear = true }),
+  pattern = { "razor", "cshtml" },
+  callback = function(args)
+    local ok = pcall(vim.treesitter.start, args.buf, "razor")
+
+    if not ok then
+      vim.bo[args.buf].syntax = "html"
+      pcall(vim.treesitter.start, args.buf, "html")
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd({ "BufAdd", "BufEnter", "BufWinEnter" }, {
+  group = vim.api.nvim_create_augroup("UserRoslynVirtualHtml", { clear = true }),
+  pattern = "*__virtual.html",
+  callback = function(args)
+    if vim.bo[args.buf].filetype == "html" then
+      return
+    end
+
+    vim.bo[args.buf].filetype = "html"
+    pcall(vim.api.nvim_exec_autocmds, "FileType", {
+      buffer = args.buf,
+      modeline = false,
+    })
+  end,
+})
+
+do
+  local ok, stl_utils = pcall(require, "nvchad.stl.utils")
+
+  if ok then
+    stl_utils.lsp = function()
+      if not rawget(vim, "lsp") then
+        return ""
+      end
+
+      local bufnr = stl_utils.stbufnr()
+      local names = {}
+      local seen = {}
+
+      for _, client in ipairs(vim.lsp.get_clients { bufnr = bufnr }) do
+        if not seen[client.name] then
+          seen[client.name] = true
+          table.insert(names, client.name)
+        end
+      end
+
+      if #names == 0 then
+        return ""
+      end
+
+      table.sort(names)
+
+      return (vim.o.columns > 100 and "   LSP ~ " .. table.concat(names, ",") .. " ") or "   LSP "
+    end
+  end
+end
+
+vim.api.nvim_create_autocmd({ "BufEnter", "BufWinEnter", "LspAttach", "LspDetach" }, {
+  group = vim.api.nvim_create_augroup("UserStatuslineLspRefresh", { clear = true }),
+  callback = function()
+    vim.cmd.redrawstatus()
+  end,
+})

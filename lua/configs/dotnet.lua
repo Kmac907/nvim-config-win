@@ -41,33 +41,6 @@ local function csharpier_path()
   return paths.first(paths.mason_bin "csharpier", paths.executable "csharpier")
 end
 
-local function roslyn_cmd()
-  local roslyn = paths.first(paths.mason_bin "roslyn", paths.executable "roslyn")
-  if not roslyn then
-    return nil
-  end
-
-  local rzls_root = paths.mason_path("rzls", "libexec")
-  if not rzls_root then
-    return { roslyn, "--stdio" }
-  end
-
-  return {
-    roslyn,
-    "--stdio",
-    "--logLevel=Information",
-    "--extensionLogDirectory=" .. vim.fs.dirname(vim.lsp.get_log_path()),
-    "--razorSourceGenerator=" .. vim.fs.joinpath(rzls_root, "Microsoft.CodeAnalysis.Razor.Compiler.dll"),
-    "--razorDesignTimePath=" .. vim.fs.joinpath(rzls_root, "Targets", "Microsoft.NET.Sdk.Razor.DesignTime.targets"),
-    "--extension",
-    vim.fs.joinpath(rzls_root, "RazorExtension", "Microsoft.VisualStudioCode.RazorExtension.dll"),
-  }
-end
-
-local function rzls_path()
-  return paths.first(paths.mason_bin "rzls", paths.executable "rzls")
-end
-
 local function lsp_capabilities()
   local nvchad_lsp = require "nvchad.configs.lspconfig"
   local capabilities = vim.deepcopy(nvchad_lsp.capabilities)
@@ -97,8 +70,6 @@ local function lsp_capabilities()
 
   return capabilities
 end
-
-local setup_rzls
 
 local function on_attach(client, bufnr)
   local nvchad_lsp = require "nvchad.configs.lspconfig"
@@ -221,12 +192,11 @@ local function start_roslyn_for_buffer(bufnr)
     return
   end
 
-  local existing = vim.lsp.get_clients { bufnr = bufnr, name = "roslyn" }
-  if #existing > 0 then
+  if vim.lsp.is_enabled and vim.lsp.is_enabled "roslyn" then
     return
   end
 
-  pcall(vim.lsp.start, config, { bufnr = bufnr })
+  pcall(vim.lsp.enable, "roslyn")
 end
 
 local function refresh_dotnet_buffers()
@@ -256,7 +226,6 @@ local function restart_dotnet_lsp(bufnr)
   suppress_roslyn_stop_notice = true
   local stopped = stop_client_group {
     roslyn = true,
-    rzls = true,
     aftershave = true,
   }
 
@@ -270,7 +239,6 @@ local function restart_dotnet_lsp(bufnr)
       return
     end
 
-    setup_rzls()
     vim.lsp.enable "roslyn"
 
     if vim.api.nvim_win_is_valid(current_win) then
@@ -351,39 +319,6 @@ local function active_dotnet_root(bufnr)
   return vim.fs.dirname(vim.fs.normalize(path))
 end
 
-setup_rzls = function()
-  local ok_rzls, rzls = pcall(require, "rzls")
-  if not ok_rzls then
-    return
-  end
-
-  vim.api.nvim_create_autocmd({ "BufReadPre", "BufNewFile" }, {
-    group = vim.api.nvim_create_augroup("UserRazorVirtualBuffers", { clear = true }),
-    pattern = { "*__virtual.cs", "*__virtual.html" },
-    callback = function(args)
-      vim.bo[args.buf].swapfile = false
-      vim.bo[args.buf].undofile = false
-      vim.bo[args.buf].bufhidden = "wipe"
-    end,
-  })
-
-  local cwd = vim.fn.getcwd()
-  local root = active_dotnet_root()
-  if root and root ~= "" then
-    vim.fn.chdir(root)
-  end
-
-  rzls.setup {
-    capabilities = lsp_capabilities(),
-    on_attach = on_attach,
-    path = rzls_path(),
-  }
-
-  if root and root ~= "" then
-    vim.fn.chdir(cwd)
-  end
-end
-
 local function easy_dotnet_lsp_settings()
   return {
     ["csharp|background_analysis"] = {
@@ -422,35 +357,8 @@ local function easy_dotnet_lsp_settings()
   }
 end
 
-local function bridge_easy_dotnet_to_rzls()
-  local ok_constants, constants = pcall(require, "easy-dotnet.constants")
-  if ok_constants then
-    constants.lsp_client_name = "roslyn"
-  end
-
-  local ok_razor, razor = pcall(require, "rzls.razor")
-  if ok_razor then
-    razor.lsp_names[razor.language_kinds.csharp] = "roslyn"
-  end
-end
-
-local function mark_roslyn_initialized()
-  local config = vim.lsp.config.roslyn
-  if not config or not config.handlers then
-    return
-  end
-
-  local original = config.handlers["workspace/projectInitializationComplete"]
-  if not original or config.handlers._user_roslyn_ready_wrapped then
-    return
-  end
-
-  config.handlers._user_roslyn_ready_wrapped = true
-  config.handlers["workspace/projectInitializationComplete"] = function(err, result, ctx, handler_config)
-    _G.roslyn_initialized = true
-    vim.api.nvim_exec_autocmds("User", { pattern = "RoslynInitialized" })
-    return original(err, result, ctx, handler_config)
-  end
+local function bridge_easy_dotnet_to_roslyn()
+  return
 end
 
 local function nearest_project(path)
@@ -968,7 +876,7 @@ local function override_easy_dotnet_roslyn_filetypes()
     return
   end
 
-  config.filetypes = { "cs" }
+  config.filetypes = { "cs", "razor", "cshtml" }
 end
 
 local function override_easy_dotnet_roslyn_on_exit()
@@ -1009,6 +917,38 @@ local function disable_aftershave_semantic_tokens()
 
       client.server_capabilities.semanticTokensProvider = nil
       pcall(vim.lsp.semantic_tokens.stop, args.buf, client.id)
+    end,
+  })
+end
+
+local function disable_roslyn_razor_noise()
+  local group = vim.api.nvim_create_augroup("UserDotnetRoslynRazorGuards", { clear = true })
+
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = group,
+    callback = function(args)
+      local client_id = args.data and args.data.client_id
+      if not client_id then
+        return
+      end
+
+      local client = vim.lsp.get_client_by_id(client_id)
+      if not client or client.name ~= "roslyn" then
+        return
+      end
+
+      local ft = vim.bo[args.buf].filetype
+      if ft ~= "razor" and ft ~= "cshtml" then
+        return
+      end
+
+      if vim.lsp.semantic_tokens and vim.lsp.semantic_tokens.enable then
+        pcall(vim.lsp.semantic_tokens.enable, false, { bufnr = args.buf, client_id = client.id })
+      end
+
+      if vim.lsp.codelens and vim.lsp.codelens.enable then
+        pcall(vim.lsp.codelens.enable, false, { bufnr = args.buf, client_id = client.id })
+      end
     end,
   })
 end
@@ -1068,7 +1008,6 @@ end
 
 function M.setup_roslyn()
   local config = {
-    cmd = roslyn_cmd(),
     capabilities = lsp_capabilities(),
     on_attach = on_attach,
     settings = {
@@ -1113,13 +1052,7 @@ function M.setup_roslyn()
     },
   }
 
-  local ok_rzls, roslyn_handlers = pcall(require, "rzls.roslyn_handlers")
-  if ok_rzls then
-    config.handlers = roslyn_handlers
-  end
-
   vim.lsp.config("roslyn", config)
-  setup_rzls()
 
   require("roslyn").setup {
     broad_search = true,
@@ -1127,11 +1060,13 @@ function M.setup_roslyn()
     lock_target = false,
     silent = false,
   }
+
+  pcall(vim.lsp.enable, "roslyn")
 end
 
 function M.setup_easy_dotnet()
   ensure_dotnet_tools_on_path()
-  bridge_easy_dotnet_to_rzls()
+  bridge_easy_dotnet_to_roslyn()
 
   do
     local ok, current_solution = pcall(require, "easy-dotnet.current_solution")
@@ -1186,13 +1121,9 @@ function M.setup_easy_dotnet()
   override_easy_dotnet_secrets()
   override_easy_dotnet_workspace_warning()
   override_easy_dotnet_terminal()
-  override_easy_dotnet_roslyn_root_dir()
-  override_easy_dotnet_roslyn_filetypes()
-  override_easy_dotnet_roslyn_on_exit()
   disable_aftershave_semantic_tokens()
+  disable_roslyn_razor_noise()
   create_roslyn_commands()
-  mark_roslyn_initialized()
-  setup_rzls()
 
   local group = vim.api.nvim_create_augroup("UserEasyDotnetSolution", { clear = true })
 

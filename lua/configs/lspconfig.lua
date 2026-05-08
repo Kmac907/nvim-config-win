@@ -123,7 +123,12 @@ vim.api.nvim_create_autocmd("LspAttach", {
     local bufname = vim.api.nvim_buf_get_name(args.buf)
     local is_razor_buffer = ft == "razor" or ft == "cshtml" or bufname:match "__virtual%."
 
-    if client and client.server_capabilities.inlayHintProvider and vim.lsp.inlay_hint and not is_razor_buffer then
+    if is_razor_buffer and vim.lsp.inlay_hint then
+      pcall(vim.lsp.inlay_hint.enable, false, { bufnr = args.buf })
+      return
+    end
+
+    if client and client.server_capabilities.inlayHintProvider and vim.lsp.inlay_hint then
       vim.lsp.inlay_hint.enable(true, { bufnr = args.buf })
     end
   end,
@@ -174,7 +179,7 @@ local server_configs = {
   },
   html = {
     cmd = html_cmd and { html_cmd, "--stdio" } or nil,
-    filetypes = { "html" },
+    filetypes = { "html", "razor", "cshtml" },
   },
   cssls = {
     cmd = css_cmd and { css_cmd, "--stdio" } or nil,
@@ -205,7 +210,6 @@ local server_configs = {
       "scss",
       "sass",
       "html",
-      "razor",
       "javascriptreact",
       "typescriptreact",
     },
@@ -221,14 +225,6 @@ local server_configs = {
       "package.json",
       ".git",
     }, true),
-    settings = {
-      tailwindCSS = {
-        includeLanguages = {
-          razor = "html",
-          cshtml = "html",
-        },
-      },
-    },
   },
   marksman = {
     cmd = marksman_cmd and { marksman_cmd, "server" } or nil,
