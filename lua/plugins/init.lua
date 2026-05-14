@@ -26,6 +26,12 @@ return {
         show_end = true,
         include = {
           node_type = {
+            powershell = {
+              "class_statement",
+              "class_method_definition",
+              "statement_block",
+              "function_statement",
+            },
             razor = {
               "razor_block",
               "razor_compound_using",
